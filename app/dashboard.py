@@ -4,12 +4,13 @@ dashboard.py
 Live monitoring dashboard for Smart Airbag Helmet.
 
 Streams IMU data through the ML model and displays real-time state in the terminal.
-Includes a simple ASCII visualization of crash probability over time.
+Includes ASCII visualization of crash/near-crash probabilities and an event history log.
 
 Run:
     python app/dashboard.py                     # synthetic demo
     python app/dashboard.py --session 5         # replay session 5
-    python app/dashboard.py --hardware --port /dev/ttyUSB0   # live ESP32 data
+    python app/dashboard.py --reset-lock        # clear lock & run
+    python app/dashboard.py --delay 0.05        # smooth terminal streaming
 """
 
 import os
@@ -37,28 +38,29 @@ SENSOR_COLS = ["ax", "ay", "az", "gx", "gy", "gz"]
 HG_COLS     = ["hg_ax", "hg_ay", "hg_az"]
 ALL_COLS    = SENSOR_COLS + HG_COLS
 
+RESET  = "\033[0m"
+BOLD   = "\033[1m"
+RED    = "\033[91m"
+YELLOW = "\033[93m"
+GREEN  = "\033[92m"
+CYAN   = "\033[96m"
+ORANGE = "\033[38;5;208m"
+BG_RED = "\033[41m\033[97m\033[1m"
+
 LABEL_STYLES = {
-    0: ("Normal",     "[ OK ]", "\033[92m"),   # Green
-    1: ("Near-Crash", "[ !! ]", "\033[93m"),   # Yellow
-    2: ("Crash",      "[CRASH]", "\033[91m"),  # Red
+    0: ("Normal",     "[ OK ]",  GREEN),
+    1: ("Near-Crash", "[ !! ]",  YELLOW),
+    2: ("Crash",      "[CRASH]", RED),
 }
-RESET = "\033[0m"
-BOLD  = "\033[1m"
 
 
-def clear_line():
-    print("\033[2K\033[1G", end="")
-
-
-def prob_bar(p: float, width: int = 30) -> str:
+def prob_bar(p: float, width: int = 30, is_crash: bool = False) -> str:
     filled = int(p * width)
     bar    = "█" * filled + "░" * (width - filled)
-    if p > 0.7:
-        color = "\033[91m"  # Red
-    elif p > 0.4:
-        color = "\033[93m"  # Yellow
+    if is_crash:
+        color = RED if p > 0.4 else (YELLOW if p > 0.2 else GREEN)
     else:
-        color = "\033[92m"  # Green
+        color = ORANGE if p > 0.4 else (YELLOW if p > 0.2 else GREEN)
     return f"{color}[{bar}]{RESET} {p:.1%}"
 
 
@@ -75,7 +77,7 @@ def draw_header(meta: dict):
     print(f"{'='*70}\n")
 
 
-def draw_state(result: dict, t_ms: int, consecutive: int, n_windows: int):
+def draw_state(result: dict, t_ms: int, consecutive: int, n_windows: int, event_log: list, deploy_fired: bool):
     label      = result["label"]
     label_name = result["label_name"]
     symbol, lbl_str, color = LABEL_STYLES.get(label, ("?", "[ ?? ]", ""))
@@ -84,39 +86,54 @@ def draw_state(result: dict, t_ms: int, consecutive: int, n_windows: int):
     nc_p    = result["near_crash_prob"]
     inf_ms  = result["infer_ms"]
 
-    print(f"\r  t={t_ms:>6}ms  {color}{BOLD}{lbl_str} {label_name:<12}{RESET}  "
-          f"Infer: {inf_ms:.2f}ms  Win: {n_windows:>5}", end="")
+    print(f"  t={t_ms:>6}ms  {color}{BOLD}{lbl_str} {label_name:<12}{RESET}  "
+          f"Infer: {inf_ms:.2f}ms  Win: {n_windows:>5}\n")
 
-    print()
-    print(f"  Crash  : {prob_bar(crash_p, 30)}")
-    print(f"  NC     : {prob_bar(nc_p,    30)}")
+    print(f"  Crash Probability : {prob_bar(crash_p, 30, is_crash=True)}")
+    print(f"  Near-Crash Prob   : {prob_bar(nc_p,    30, is_crash=False)}\n")
 
-    if label == 2:
-        print(f"\n  {BOLD}\033[91m>>> CRASH GATE: {consecutive}/{CONSECUTIVE_WINDOWS_REQ} <<<{RESET}")
-    elif label == 1:
-        print(f"\n  \033[93m>>> NEAR-CRASH WARNING <<<{RESET}")
+    # ---- STATUS ALERT BANNERS ----
+    if deploy_fired:
+        print(f"  {BG_RED} 💥💥💥 AIRBAG DEPLOYED! SOLENOID TRIGGERED & LOCK WRITTEN 💥💥💥 {RESET}\n")
+    elif label == 2:
+        print(f"  {RED}{BOLD}┌────────────────────────────────────────────────────────────┐{RESET}")
+        print(f"  {RED}{BOLD}│ 🚨 CRASH DETECTED! Gate Check: {consecutive}/{CONSECUTIVE_WINDOWS_REQ} consecutive windows  │{RESET}")
+        print(f"  {RED}{BOLD}└────────────────────────────────────────────────────────────┘{RESET}\n")
+    elif label == 1 or nc_p > NEAR_CRASH_THRESHOLD:
+        print(f"  {YELLOW}{BOLD}┌────────────────────────────────────────────────────────────┐{RESET}")
+        print(f"  {YELLOW}{BOLD}│ ⚠️ NEAR-CRASH WARNING! (Pothole / Sudden Brake / Near-Miss) │{RESET}")
+        print(f"  {YELLOW}{BOLD}│    LED / Buzzer Pulse Triggered (GPIO 27)                  │{RESET}")
+        print(f"  {YELLOW}{BOLD}└────────────────────────────────────────────────────────────┘{RESET}\n")
     else:
-        print()
+        print(f"  {GREEN}[ SYSTEM NORMAL ] Riding Telemetry Nominal.{RESET}\n")
 
+    # ---- EVENT LOG HISTORY ----
+    print(f"  {BOLD}{CYAN}── RECENT ALERTS & EVENTS HISTORY ───────────────────────────{RESET}")
+    if not event_log:
+        print(f"  {CYAN}(Monitoring stream for events...){RESET}")
+    else:
+        for ev in event_log[-6:]:
+            print(f"  {ev}")
     print(f"  {'─'*60}")
 
 
-def run_dashboard(model, meta, stream, hardware=False, verbose=True):
+def run_dashboard(model, meta, stream, hardware=False, delay=0.04):
     feature_names = meta.get("feature_names", [])
     buffer        = deque(maxlen=WINDOW_SIZE * 2)
     consecutive   = 0
     deploy_fired  = is_deployed()
     n_windows     = 0
     samples_seen  = 0
+    event_log     = []
+    last_event_state = None
 
     draw_header(meta)
 
     if deploy_fired:
-        print("\033[91m[LOCKED] Airbag already deployed! Reset lock to continue.\033[0m")
+        print("\033[91m[LOCKED] Airbag already deployed! Pass --reset-lock to continue.\033[0m")
         return
 
     log_path = os.path.join(project_root, "logs", "dashboard_log.csv")
-
     stride_counter = 0
 
     for sample in iter(stream.read_sample, None):
@@ -142,48 +159,62 @@ def run_dashboard(model, meta, stream, hardware=False, verbose=True):
             while len(proba) < 3:
                 proba = np.append(proba, 0.0)
 
+            crash_prob = float(proba[2])
+            nc_prob    = float(proba[1])
+
             result = {
                 "label"          : pred_label,
                 "label_name"     : LABEL_STYLES.get(pred_label, ("?","?","?"))[0],
-                "crash_prob"     : float(proba[2]),
-                "near_crash_prob": float(proba[1]),
+                "crash_prob"     : crash_prob,
+                "near_crash_prob": nc_prob,
                 "infer_ms"       : infer_ms,
             }
 
             n_windows += 1
             t_ms = int(samples_seen / SAMPLE_RATE_HZ * 1000)
 
-            # Redraw state
-            os.system("cls" if os.name == "nt" else "clear")
-            draw_header(meta)
-            draw_state(result, t_ms, consecutive, n_windows)
+            # Near-crash warning logic
+            if pred_label == 1 or nc_prob > NEAR_CRASH_THRESHOLD:
+                if last_event_state != 1:
+                    event_log.append(f"{YELLOW}[{t_ms:>5}ms] ⚠️  NEAR-CRASH WARNING (NC Prob: {nc_prob:.1%}){RESET}")
+                    last_event_state = 1
+                if hardware:
+                    trigger_near_crash_warning()
 
-            # Near-crash
-            if pred_label == 1 and hardware:
-                trigger_near_crash_warning()
-
-            # Crash gate
-            if result["crash_prob"] > CRASH_PROB_THRESHOLD:
+            # Crash gate logic
+            if crash_prob > CRASH_PROB_THRESHOLD:
                 consecutive += 1
+                if last_event_state != 2:
+                    event_log.append(f"{RED}[{t_ms:>5}ms] 🚨 CRASH DETECTED — Window {consecutive}/{CONSECUTIVE_WINDOWS_REQ} (Crash Prob: {crash_prob:.1%}){RESET}")
+                    last_event_state = 2
+
                 if consecutive >= CONSECUTIVE_WINDOWS_REQ and not deploy_fired:
-                    print(f"\n  {BOLD}\033[91m{'!'*60}\033[0m")
-                    print(f"  {BOLD}\033[91m  AIRBAG DEPLOYED at t={t_ms}ms\033[0m")
-                    print(f"  {BOLD}\033[91m{'!'*60}\033[0m\n")
+                    event_log.append(f"{BG_RED}[{t_ms:>5}ms] 💥 AIRBAG DEPLOYED! Lock file written.{RESET}")
                     set_deployed_lock()
                     deploy_fired = True
                     if hardware:
                         trigger_airbag_gpio()
-                        send_sms_alert(f"CRASH t={t_ms}ms p={result['crash_prob']:.1%}")
+                        send_sms_alert(f"CRASH t={t_ms}ms p={crash_prob:.1%}")
             else:
                 consecutive = 0
+                if pred_label == 0 and last_event_state != 0:
+                    event_log.append(f"{GREEN}[{t_ms:>5}ms] ✅ System state nominal (Normal riding){RESET}")
+                    last_event_state = 0
+
+            # Redraw state
+            draw_header(meta)
+            draw_state(result, t_ms, consecutive, n_windows, event_log, deploy_fired)
 
             log_to_sd({
                 "t_ms": t_ms, "label": pred_label,
-                "crash_prob": round(result["crash_prob"], 4),
-                "nc_prob"   : round(result["near_crash_prob"], 4),
+                "crash_prob": round(crash_prob, 4),
+                "nc_prob"   : round(nc_prob, 4),
                 "infer_ms"  : round(infer_ms, 4),
                 "deployed"  : deploy_fired,
             }, log_path)
+
+            if delay > 0:
+                time.sleep(delay)
 
     print(f"\n  Dashboard complete. Windows: {n_windows} | Deployed: {deploy_fired}")
 
@@ -198,15 +229,22 @@ if __name__ == "__main__":
     parser.add_argument("--session",    type=int, default=None)
     parser.add_argument("--hardware",   action="store_true")
     parser.add_argument("--port",       default="/dev/ttyUSB0",   help="Serial port (hardware mode)")
-    parser.add_argument("--reset-lock", action="store_true")
+    parser.add_argument("--reset-lock", action="store_true",     help="Reset deployment lock before running")
+    parser.add_argument("--delay",      type=float, default=0.04, help="Pacing delay in seconds per window (default 0.04s)")
     args = parser.parse_args()
 
     from src.predict import clear_deploy_lock
     if args.reset_lock:
         clear_deploy_lock()
 
-    model = joblib.load(os.path.join(args.model_dir, "best_model.pkl"))
-    meta  = joblib.load(os.path.join(args.model_dir, "model_meta.pkl"))
+    model_dir = args.model_dir
+    if not os.path.isabs(model_dir) and not os.path.exists(os.path.join(model_dir, "best_model.pkl")):
+        alt_dir = os.path.join(project_root, model_dir)
+        if os.path.exists(os.path.join(alt_dir, "best_model.pkl")):
+            model_dir = alt_dir
+
+    model = joblib.load(os.path.join(model_dir, "best_model.pkl"))
+    meta  = joblib.load(os.path.join(model_dir, "model_meta.pkl"))
 
     # Build stream
     if args.hardware:
@@ -215,7 +253,12 @@ if __name__ == "__main__":
         stream = SerialIMUReader(args.port)
     elif args.session is not None:
         from src.raspberry_pi_interface import SyntheticIMUStream
-        df      = pd.read_csv(args.dataset)
+        dataset_path = args.dataset
+        if not os.path.isabs(dataset_path) and not os.path.exists(dataset_path):
+            alt_dataset = os.path.join(project_root, dataset_path)
+            if os.path.exists(alt_dataset):
+                dataset_path = alt_dataset
+        df      = pd.read_csv(dataset_path)
         sess_df = df[df["session_id"] == args.session].reset_index(drop=True)
 
         class ReplayStream:
@@ -234,7 +277,7 @@ if __name__ == "__main__":
         stream = SyntheticIMUStream()
 
     try:
-        run_dashboard(model, meta, stream, hardware=args.hardware)
+        run_dashboard(model, meta, stream, hardware=args.hardware, delay=args.delay)
     finally:
         if hasattr(stream, "close"):
             stream.close()

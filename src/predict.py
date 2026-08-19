@@ -43,8 +43,12 @@ CRASH_PROB_THRESHOLD    = 0.70   # Crash probability must exceed this per window
 CONSECUTIVE_WINDOWS_REQ = 3      # Number of consecutive Crash predictions required
 NEAR_CRASH_THRESHOLD    = 0.40   # Near-Crash probability threshold for warning
 
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
 # Persistent lock file — prevents re-deployment even after script restart
-DEPLOY_LOCK_FILE = os.path.join(os.path.dirname(__file__), "..", "AIRBAG_DEPLOYED.lock")
+DEPLOY_LOCK_FILE = os.path.join(PROJECT_ROOT, "AIRBAG_DEPLOYED.lock")
 
 
 # -------------------------------------------------
@@ -53,6 +57,11 @@ DEPLOY_LOCK_FILE = os.path.join(os.path.dirname(__file__), "..", "AIRBAG_DEPLOYE
 
 def load_model(model_dir: str = "models"):
     """Load best_model.pkl + metadata."""
+    if not os.path.isabs(model_dir) and not os.path.exists(os.path.join(model_dir, "best_model.pkl")):
+        alt_dir = os.path.join(PROJECT_ROOT, model_dir)
+        if os.path.exists(os.path.join(alt_dir, "best_model.pkl")):
+            model_dir = alt_dir
+
     model_path = os.path.join(model_dir, "best_model.pkl")
     meta_path  = os.path.join(model_dir, "model_meta.pkl")
 
@@ -71,6 +80,7 @@ def load_model(model_dir: str = "models"):
     print(f"        Infer ms : {meta.get('infer_ms', '?'):.4f} ms/sample")
     print(f"        Features : {len(meta.get('feature_names', []))}")
     return model, meta
+
 
 
 # -------------------------------------------------
@@ -407,10 +417,16 @@ if __name__ == "__main__":
 
     model, meta = load_model(args.model_dir)
 
-    if args.session is not None and os.path.exists(args.dataset):
+    dataset_path = args.dataset
+    if not os.path.isabs(dataset_path) and not os.path.exists(dataset_path):
+        alt_dataset = os.path.join(PROJECT_ROOT, dataset_path)
+        if os.path.exists(alt_dataset):
+            dataset_path = alt_dataset
+
+    if args.session is not None and os.path.exists(dataset_path):
         run_live_simulation(model, meta,
                             source="replay",
-                            dataset_path=args.dataset,
+                            dataset_path=dataset_path,
                             session_id=args.session,
                             delay=args.delay,
                             verbose=not args.no_verbose,
